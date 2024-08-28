@@ -588,6 +588,18 @@ impl<T: RcObject> Rc<T> {
             Some(unsafe { self.deref_mut() })
         }
     }
+
+    #[inline]
+    pub unsafe fn into_inner(self) -> Option<T> {
+        let ptr = self.ptr.as_raw();
+        forget(self);
+
+        if ptr.is_null() {
+            return None;
+        }
+        assert!((*ptr).strong_count() == 1);
+        Some(Box::from_raw(ptr).into_inner())
+    }
 }
 
 impl<T: RcObject> Default for Rc<T> {

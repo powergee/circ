@@ -256,6 +256,16 @@ impl<T> RcInner<T> {
         }
         !old.destructed()
     }
+
+    #[inline]
+    pub(crate) fn strong_count(&self) -> u32 {
+        State::from_raw(self.state.load(Ordering::Relaxed)).strong()
+    }
+
+    #[inline]
+    pub(crate) unsafe fn into_inner(self) -> T {
+        ManuallyDrop::into_inner(self.storage)
+    }
 }
 
 impl<T: RcObject> RcInner<T> {
