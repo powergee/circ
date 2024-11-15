@@ -4,6 +4,7 @@ use core::mem::align_of;
 use core::ptr::null_mut;
 use core::sync::atomic::AtomicUsize;
 use std::fmt::{Debug, Formatter, Pointer};
+use static_assertions::const_assert_eq;
 
 use atomic::{Atomic, Ordering};
 
@@ -203,8 +204,9 @@ impl<T> RawAtomic<T> {
     }
 
     pub fn fetch_or<'g>(&self, tag: usize, order: Ordering, _: &'g Guard) -> RawShared<'g, T> {
-        // HACK: The size and alignment of `Atomic<TaggedCnt<T>>` will be same with `AtomicUsize`.
-        // The equality of the sizes is checked by `const_assert!`.
+        // HACK: The size and alignment of `Atomic<Tagged<T>>` will be same with `AtomicUsize`.
+        const_assert_eq!(size_of::<Atomic<Tagged<u8>>>(), size_of::<AtomicUsize>());
+        const_assert_eq!(align_of::<Atomic<Tagged<u8>>>(), align_of::<AtomicUsize>());
         let inner = unsafe { &*(&self.inner as *const _ as *const AtomicUsize) };
         let prev = inner.fetch_or(low_bits::<T>() & tag, order);
         RawShared::from(prev as *const _)
