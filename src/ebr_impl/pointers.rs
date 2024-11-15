@@ -3,8 +3,8 @@ use core::marker::PhantomData;
 use core::mem::align_of;
 use core::ptr::null_mut;
 use core::sync::atomic::AtomicUsize;
-use std::fmt::{Debug, Formatter, Pointer};
 use static_assertions::const_assert_eq;
+use std::fmt::{Debug, Formatter, Pointer};
 
 use atomic::{Atomic, Ordering};
 
