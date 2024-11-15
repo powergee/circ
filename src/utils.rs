@@ -448,5 +448,9 @@ pub(crate) unsafe fn try_ird_with_raw<T: RcObject>(
     ctx: DisposeContext<'_>,
     succ_epoch: u32,
 ) {
-    try_imm_recur_destr(Rc::from_raw(transmute::<_, Raw<T>>(next)), ctx, succ_epoch);
+    try_imm_recur_destr(
+        Rc::from_raw(transmute::<Raw<()>, Raw<T>>(next)),
+        ctx,
+        succ_epoch,
+    );
 }

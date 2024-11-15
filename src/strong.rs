@@ -92,7 +92,7 @@ impl<'r> EdgeTaker<'r> {
     pub fn take<T: RcObject>(&mut self, outgoing: &mut impl OwnRc<T>) {
         let rc = outgoing.take().into_raw();
         self.popped.push(TryIRD {
-            rc: unsafe { transmute::<_, Raw<()>>(rc) },
+            rc: unsafe { transmute::<Raw<T>, Raw<()>>(rc) },
             ird: try_ird_with_raw::<T>,
         });
     }
@@ -790,13 +790,13 @@ pub struct Snapshot<'g, T> {
     pub(crate) _marker: PhantomData<&'g T>,
 }
 
-impl<'g, T> Clone for Snapshot<'g, T> {
+impl<T> Clone for Snapshot<'_, T> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'g, T> Copy for Snapshot<'g, T> {}
+impl<T> Copy for Snapshot<'_, T> {}
 
 impl<'g, T: RcObject> Snapshot<'g, T> {
     /// Returns `true` if the pointer is null ignoring the tag.
@@ -921,41 +921,41 @@ impl<'g, T> Snapshot<'g, T> {
     }
 }
 
-impl<'g, T: RcObject> Default for Snapshot<'g, T> {
+impl<T: RcObject> Default for Snapshot<'_, T> {
     #[inline]
     fn default() -> Self {
         Self::null()
     }
 }
 
-impl<'g, T: RcObject + PartialEq> PartialEq for Snapshot<'g, T> {
+impl<T: RcObject + PartialEq> PartialEq for Snapshot<'_, T> {
     #[inline(always)]
     fn eq(&self, other: &Self) -> bool {
         self.as_ref() == other.as_ref()
     }
 }
 
-impl<'g, T: RcObject + Eq> Eq for Snapshot<'g, T> {}
+impl<T: RcObject + Eq> Eq for Snapshot<'_, T> {}
 
-impl<'g, T: RcObject + Hash> Hash for Snapshot<'g, T> {
+impl<T: RcObject + Hash> Hash for Snapshot<'_, T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.as_ref().hash(state);
     }
 }
 
-impl<'g, T: RcObject + PartialOrd> PartialOrd for Snapshot<'g, T> {
+impl<T: RcObject + PartialOrd> PartialOrd for Snapshot<'_, T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         self.as_ref().partial_cmp(&other.as_ref())
     }
 }
 
-impl<'g, T: RcObject + Ord> Ord for Snapshot<'g, T> {
+impl<T: RcObject + Ord> Ord for Snapshot<'_, T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.as_ref().cmp(&other.as_ref())
     }
 }
 
-impl<'g, T: RcObject + Debug> Debug for Snapshot<'g, T> {
+impl<T: RcObject + Debug> Debug for Snapshot<'_, T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         if let Some(cnt) = self.as_ref() {
             f.debug_tuple("RcObject").field(cnt).finish()
@@ -965,7 +965,7 @@ impl<'g, T: RcObject + Debug> Debug for Snapshot<'g, T> {
     }
 }
 
-impl<'g, T: RcObject> Pointer for Snapshot<'g, T> {
+impl<T: RcObject> Pointer for Snapshot<'_, T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         Pointer::fmt(&self.ptr, f)
     }

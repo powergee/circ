@@ -217,15 +217,15 @@ pub(crate) struct RawShared<'g, T> {
     _marker: PhantomData<&'g T>,
 }
 
-impl<'g, T> Clone for RawShared<'g, T> {
+impl<T> Clone for RawShared<'_, T> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'g, T> Copy for RawShared<'g, T> {}
+impl<T> Copy for RawShared<'_, T> {}
 
-impl<'g, T> From<*const T> for RawShared<'g, T> {
+impl<T> From<*const T> for RawShared<'_, T> {
     fn from(value: *const T) -> Self {
         Self {
             inner: Tagged::from(value),
@@ -234,7 +234,7 @@ impl<'g, T> From<*const T> for RawShared<'g, T> {
     }
 }
 
-impl<'g, T> From<*mut T> for RawShared<'g, T> {
+impl<T> From<*mut T> for RawShared<'_, T> {
     fn from(value: *mut T) -> Self {
         Self {
             inner: Tagged::from(value),
@@ -243,7 +243,7 @@ impl<'g, T> From<*mut T> for RawShared<'g, T> {
     }
 }
 
-impl<'g, T> From<Tagged<T>> for RawShared<'g, T> {
+impl<T> From<Tagged<T>> for RawShared<'_, T> {
     fn from(inner: Tagged<T>) -> Self {
         Self {
             inner,

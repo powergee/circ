@@ -435,13 +435,13 @@ pub struct WeakSnapshot<'g, T> {
     pub(crate) _marker: PhantomData<&'g T>,
 }
 
-impl<'g, T> Clone for WeakSnapshot<'g, T> {
+impl<T> Clone for WeakSnapshot<'_, T> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'g, T> Copy for WeakSnapshot<'g, T> {}
+impl<T> Copy for WeakSnapshot<'_, T> {}
 
 impl<'g, T> WeakSnapshot<'g, T> {
     /// Returns `true` if the pointer is null ignoring the tag.
@@ -519,7 +519,7 @@ impl<'g, T> WeakSnapshot<'g, T> {
     }
 }
 
-impl<'g, T> Default for WeakSnapshot<'g, T> {
+impl<T> Default for WeakSnapshot<'_, T> {
     #[inline]
     fn default() -> Self {
         Self::null()
@@ -532,13 +532,13 @@ impl<'g, T: RcObject> From<Snapshot<'g, T>> for WeakSnapshot<'g, T> {
     }
 }
 
-impl<'g, T> Debug for WeakSnapshot<'g, T> {
+impl<T> Debug for WeakSnapshot<'_, T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         Debug::fmt(&self.ptr, f)
     }
 }
 
-impl<'g, T> Pointer for WeakSnapshot<'g, T> {
+impl<T> Pointer for WeakSnapshot<'_, T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         Pointer::fmt(&self.ptr, f)
     }
