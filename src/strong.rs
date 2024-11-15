@@ -3,7 +3,7 @@ use std::{
     fmt::{Debug, Formatter, Pointer},
     hash::{Hash, Hasher},
     marker::PhantomData,
-    mem::{forget, size_of},
+    mem::{forget, size_of, take, transmute},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -11,7 +11,7 @@ use atomic::Atomic;
 use static_assertions::const_assert;
 
 use crate::ebr_impl::{global_epoch, Guard, Tagged};
-use crate::utils::{Raw, RcInner};
+use crate::utils::{try_ird_with_raw, DisposeContext, Raw, RcInner};
 use crate::{Weak, WeakSnapshot};
 
 /// A common trait for reference-counted object types.
@@ -23,7 +23,7 @@ use crate::{Weak, WeakSnapshot};
 /// # Examples
 ///
 /// ```
-/// use circ::{AtomicRc, RcObject, Rc};
+/// use circ::{AtomicRc, RcObject, Rc, EdgeTaker};
 ///
 /// // A simple singly linked list node.
 /// struct ListNode {
@@ -32,8 +32,8 @@ use crate::{Weak, WeakSnapshot};
 /// }
 ///
 /// unsafe impl RcObject for ListNode {
-///     fn pop_edges(&mut self, out: &mut Vec<Rc<Self>>) {
-///         out.push(self.next.take());
+///     fn pop_edges(&mut self, out: &mut EdgeTaker<'_>) {
+///         out.take(&mut self.next);
 ///     }
 /// }
 ///
@@ -45,31 +45,63 @@ use crate::{Weak, WeakSnapshot};
 /// }
 ///
 /// unsafe impl RcObject for TreeNode {
-///     fn pop_edges(&mut self, out: &mut Vec<Rc<Self>>) {
-///         out.push(self.left.take());
-///         out.push(self.right.take());
+///     fn pop_edges(&mut self, out: &mut EdgeTaker<'_>) {
+///         out.take(&mut self.left);
+///         out.take(&mut self.right);
 ///     }
 /// }
 /// ```
 ///
 /// # Safety
 ///
-/// `pop_edges()` should add only the `Rc`s obtained from the given object. If an unrelated `Rc` is
-/// added, its referent can be prematurely reclaimed.
-///
-/// # Note
-///
-/// Currenty it supports immediate recursive destruction of single edge type. The edges of the
-/// other types must be deferred (automatically done by the destructors of `Rc` and `AtomicRc`).
+/// `out` should take the `AtomicRc`s and `Rc`s obtained from only the given object.
+/// If an unrelated `Rc` is added, its referent can be prematurely reclaimed.
 pub unsafe trait RcObject: Sized {
-    /// Takes all `Rc`s in the object and adds them to `out`.
-    /// It may be convinient to use [`AtomicRc::take`] for implementing this.
+    /// Takes all `AtomicRc`s and `Rc`s in the object by calling the `take` method of `out`.
     ///
     /// This method is called by CIRC just before the object is destructed.
     ///
     /// It does not need to take all the edges in the node, because the destructors of `Rc` and
-    /// `AtomicRc` schedule the decrement and destruction anyway.
-    fn pop_edges(&mut self, out: &mut Vec<Rc<Self>>);
+    /// `AtomicRc` schedule the decrement and destruction anyway. However, it may
+    /// impact performance and memory usage, especially if the structure forms a long chain.
+    fn pop_edges(&mut self, out: &mut EdgeTaker<'_>);
+}
+
+pub(crate) struct TryIRD {
+    rc: Raw<()>,
+    ird: unsafe fn(Raw<()>, DisposeContext, u32),
+}
+
+impl TryIRD {
+    pub(crate) unsafe fn try_ird(self, ctx: DisposeContext<'_>, succ_epoch: u32) {
+        (self.ird)(self.rc, ctx, succ_epoch)
+    }
+}
+
+pub struct EdgeTaker<'r> {
+    popped: &'r mut Vec<TryIRD>,
+}
+
+impl<'r> EdgeTaker<'r> {
+    pub(crate) fn new(popped: &'r mut Vec<TryIRD>) -> Self {
+        Self { popped }
+    }
+
+    /// Takes an underlying [`Rc`] from `outgoing` edge, and stores it in a local buffer.
+    /// The taken [`Rc`]s will be efficiently destructed by CIRC.
+    pub fn take<T: RcObject>(&mut self, outgoing: &mut impl OwnRc<T>) {
+        let rc = outgoing.take().into_raw();
+        self.popped.push(TryIRD {
+            rc: unsafe { transmute::<_, Raw<()>>(rc) },
+            ird: try_ird_with_raw::<T>,
+        });
+    }
+}
+
+/// A trait for types owning a strong reference count.
+pub trait OwnRc<T: RcObject> {
+    /// Takes an underlying [`Rc`] from this object, leaving a null pointer.
+    fn take(&mut self) -> Rc<T>;
 }
 
 impl<T> Tagged<RcInner<T>> {
@@ -345,11 +377,12 @@ impl<T: RcObject> AtomicRc<T> {
     // pub fn get_mut(&mut self) -> &mut Rc<T> {
     //     unsafe { core::mem::transmute(self.link.get_mut()) }
     // }
+}
 
-    /// Takes an underlying [`Rc`] from this [`AtomicRc`], leaving a null pointer.
+impl<T: RcObject> OwnRc<T> for AtomicRc<T> {
     #[inline]
-    pub fn take(&mut self) -> Rc<T> {
-        Rc::from_raw(core::mem::take(self.link.get_mut()))
+    fn take(&mut self) -> Rc<T> {
+        Rc::from_raw(take(self.link.get_mut()))
     }
 }
 
@@ -619,6 +652,13 @@ impl<T: RcObject> Rc<T> {
         // for clients; they are only used internally by the CIRC engine to track the last
         // accessed epoch for the pointer.
         self.ptr.ptr_eq(other.ptr)
+    }
+}
+
+impl<T: RcObject> OwnRc<T> for Rc<T> {
+    #[inline]
+    fn take(&mut self) -> Rc<T> {
+        take(self)
     }
 }
 

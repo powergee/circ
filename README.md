@@ -94,7 +94,7 @@ For in-depth discussion, see the aforementioned research paper.
 ## Example
 
 ```rust
-use circ::{cs, AtomicRc, RcObject, Rc, Snapshot};
+use circ::*;
 use std::sync::atomic::Ordering::Relaxed;
 
 // A simple singly linked list node.
@@ -107,8 +107,8 @@ struct Node {
 // This trait enables *immediate recursive destruction*.
 // Implementation is straightforward: simply add outgoing `Rc` pointers to `out`.
 unsafe impl RcObject for Node {
-    fn pop_edges(&mut self, out: &mut Vec<Rc<Self>>) {
-        out.push(self.next.take());
+    fn pop_edges(&mut self, out: &mut EdgeTaker<'_>) {
+        out.take(&mut self.next);
     }
 }
 

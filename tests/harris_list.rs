@@ -2,7 +2,7 @@
 //! (<https://www.cl.cam.ac.uk/research/srg/netos/papers/2001-caslists.pdf>).
 
 use atomic::Ordering;
-use circ::{AtomicRc, Guard, Rc, RcObject, Snapshot};
+use circ::{AtomicRc, EdgeTaker, Guard, Rc, RcObject, Snapshot};
 
 use std::cmp::Ordering::{Equal, Greater, Less};
 
@@ -13,8 +13,8 @@ struct Node<K, V> {
 }
 
 unsafe impl<K, V> RcObject for Node<K, V> {
-    fn pop_edges(&mut self, out: &mut Vec<Rc<Self>>) {
-        out.push(self.next.take())
+    fn pop_edges(&mut self, out: &mut EdgeTaker<'_>) {
+        out.take(&mut self.next);
     }
 }
 

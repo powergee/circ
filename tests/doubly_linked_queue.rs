@@ -3,7 +3,7 @@
 
 use std::sync::atomic::Ordering;
 
-use circ::{AtomicRc, Guard, Rc, RcObject, Snapshot, Weak};
+use circ::{AtomicRc, EdgeTaker, Guard, Rc, RcObject, Snapshot, Weak};
 use crossbeam_utils::CachePadded;
 
 pub struct Output<'g, T> {
@@ -26,8 +26,8 @@ struct Node<T> {
 }
 
 unsafe impl<T> RcObject for Node<T> {
-    fn pop_edges(&mut self, out: &mut Vec<Rc<Self>>) {
-        out.push(self.next.take())
+    fn pop_edges(&mut self, out: &mut EdgeTaker<'_>) {
+        out.take(&mut *self.next);
     }
 }
 

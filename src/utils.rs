@@ -1,9 +1,10 @@
 use std::cell::Cell;
+use std::mem::transmute;
 use std::sync::atomic::Ordering;
 use std::{mem::ManuallyDrop, sync::atomic::AtomicU64};
 
 use crate::ebr_impl::{cs, global_epoch, Guard, Tagged, HIGH_TAG_WIDTH};
-use crate::RcObject;
+use crate::{EdgeTaker, Rc, RcObject};
 
 /// Raw pointer to a reference counted object. Allows tagging.
 pub(crate) type Raw<T> = Tagged<RcInner<T>>;
@@ -322,33 +323,54 @@ impl<T: RcObject> RcInner<T> {
 unsafe fn dispose<T: RcObject>(inner: *mut RcInner<T>) {
     DISPOSE_COUNTER.with(|counter| {
         let guard = &cs();
-        dispose_general_node(inner, 0, counter, guard);
+        dispose_general_node(inner, DisposeContext::new(0, counter, guard));
     });
 }
 
-#[inline]
-unsafe fn dispose_general_node<T: RcObject>(
-    ptr: *mut RcInner<T>,
+#[derive(Clone)]
+pub(crate) struct DisposeContext<'d> {
     depth: usize,
-    counter: &Cell<usize>,
-    guard: &Guard,
-) {
+    counter: &'d Cell<usize>,
+    guard: &'d Guard,
+}
+
+impl<'d> DisposeContext<'d> {
+    fn new(depth: usize, counter: &'d Cell<usize>, guard: &'d Guard) -> Self {
+        Self {
+            depth,
+            counter,
+            guard,
+        }
+    }
+
+    fn deepen(self) -> Self {
+        Self {
+            depth: self.depth + 1,
+            counter: self.counter,
+            guard: self.guard,
+        }
+    }
+}
+
+#[inline]
+unsafe fn dispose_general_node<T: RcObject>(ptr: *mut RcInner<T>, ctx: DisposeContext<'_>) {
     let rc = match ptr.as_mut() {
         Some(rc) => rc,
         None => return,
     };
 
-    let count = counter.get();
-    counter.set(count + 1);
+    let count = ctx.counter.get();
+    ctx.counter.set(count + 1);
     if count % 128 == 0 {
-        if let Some(local) = guard.local.as_ref() {
+        if let Some(local) = ctx.guard.local.as_ref() {
             local.repin_without_collect();
         }
     }
 
-    if depth >= 1024 {
+    if ctx.depth >= 1024 {
         // Prevent a potential stack overflow.
-        guard.defer_with_inner(rc, |rc| RcInner::try_destruct(rc));
+        ctx.guard
+            .defer_with_inner(rc, |rc| RcInner::try_destruct(rc));
         return;
     }
 
@@ -362,54 +384,69 @@ unsafe fn dispose_general_node<T: RcObject>(
 
     // Note that checking whether it is a root is necessary, because if `node_epoch` is
     // old enough, `modu.le` may return false.
-    if depth == 0 || modu.le(node_epoch as _, curr_epoch as isize - 3) {
+    if ctx.depth == 0 || modu.le(node_epoch as _, curr_epoch as isize - 3) {
         // The current node is immediately reclaimable.
-        rc.data_mut().pop_edges(&mut outgoings);
-        unsafe {
-            ManuallyDrop::drop(&mut rc.storage);
-            if State::from_raw(rc.state.load(Ordering::SeqCst)).weaked() {
-                RcInner::decrement_weak(rc, Some(guard));
-            } else {
-                RcInner::dealloc(rc);
-            }
+        // Before freeing this allocation, let's collect outgoing edges.
+        rc.data_mut().pop_edges(&mut EdgeTaker::new(&mut outgoings));
+
+        ManuallyDrop::drop(&mut rc.storage);
+        if State::from_raw(rc.state.load(Ordering::SeqCst)).weaked() {
+            RcInner::decrement_weak(rc, Some(ctx.guard));
+        } else {
+            RcInner::dealloc(rc);
         }
+
         for next in outgoings.drain(..) {
-            if next.is_null() {
-                continue;
-            }
-
-            let next_ptr = next.into_raw();
-            let next_ref = next_ptr.deref();
-            let link_epoch = next_ptr.high_tag() as u32;
-
-            // Decrement next node's strong count and update its epoch.
-            let next_cnt = loop {
-                let cnt_curr = State::from_raw(next_ref.state.load(Ordering::SeqCst));
-                let next_epoch =
-                    modu.max(&[node_epoch as _, link_epoch as _, cnt_curr.epoch() as _]);
-                let cnt_next = cnt_curr.sub_strong(1).with_epoch(next_epoch as _);
-
-                if next_ref
-                    .state
-                    .compare_exchange(
-                        cnt_curr.as_raw(),
-                        cnt_next.as_raw(),
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                    )
-                    .is_ok()
-                {
-                    break cnt_next;
-                }
-            };
-
-            // If the reference count hit zero, try dispose it recursively.
-            if next_cnt.strong() == 0 {
-                dispose_general_node(next_ptr.as_raw(), depth + 1, counter, guard);
-            }
+            next.try_ird(ctx.clone(), node_epoch);
         }
     } else {
         // It is likely to be unsafe to reclaim right now.
-        guard.defer_with_inner(rc, |rc| RcInner::try_destruct(rc));
+        ctx.guard
+            .defer_with_inner(rc, |rc| RcInner::try_destruct(rc));
     }
+}
+
+#[inline]
+unsafe fn try_imm_recur_destr<T: RcObject>(next: Rc<T>, ctx: DisposeContext<'_>, succ_epoch: u32) {
+    if next.is_null() {
+        return;
+    }
+
+    let modu: Modular<EPOCH_WIDTH> = Modular::new(global_epoch() as isize + 1);
+    let next_ptr = next.into_raw();
+    let next_ref = next_ptr.deref();
+    let link_epoch = next_ptr.high_tag() as u32;
+
+    // Decrement next node's strong count and update its epoch.
+    let next_cnt = loop {
+        let cnt_curr = State::from_raw(next_ref.state.load(Ordering::SeqCst));
+        let next_epoch = modu.max(&[succ_epoch as _, link_epoch as _, cnt_curr.epoch() as _]);
+        let cnt_next = cnt_curr.sub_strong(1).with_epoch(next_epoch as _);
+
+        if next_ref
+            .state
+            .compare_exchange(
+                cnt_curr.as_raw(),
+                cnt_next.as_raw(),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            break cnt_next;
+        }
+    };
+
+    // If the reference count hit zero, try dispose it recursively.
+    if next_cnt.strong() == 0 {
+        dispose_general_node(next_ptr.as_raw(), ctx.deepen());
+    }
+}
+
+pub(crate) unsafe fn try_ird_with_raw<T: RcObject>(
+    next: Raw<()>,
+    ctx: DisposeContext<'_>,
+    succ_epoch: u32,
+) {
+    try_imm_recur_destr(Rc::from_raw(transmute::<_, Raw<T>>(next)), ctx, succ_epoch);
 }
