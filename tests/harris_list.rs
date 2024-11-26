@@ -4,8 +4,6 @@
 use atomic::Ordering;
 use circ::{AtomicRc, EdgeTaker, Rc, RcObject, Snapshot};
 
-use std::cmp::Ordering::{Equal, Greater, Less};
-
 struct Node<K, V> {
     next: AtomicRc<Self>,
     key: K,
@@ -97,38 +95,25 @@ impl<K: Ord, V> Cursor<K, V> {
             };
             curr_node.next.load(&mut self.next, Ordering::Acquire);
 
-            if self.next.tag() != 0 {
-                // We add a 0 tag here so that `self.curr`s tag is always 0.
-                self.next.set_tag(0);
-
-                // <prev> -?-> <curr> -x-> <next>
-                Snapshot::swap(&mut self.next, &mut self.curr);
-                // <prev> -?-> <next> -x-> <curr>
-                Snapshot::swap(&mut self.next, &mut self.prev);
-                // <next> -?-> <prev> -x-> <curr>
-
-                if self.anchor.is_null() {
-                    // <next> -> <prev> -x-> <curr>, anchor = null, anchor_next = null
-                    debug_assert!(self.anchor_next.is_null());
-                    Snapshot::swap(&mut self.next, &mut self.anchor);
-                    // <anchor> -> <prev> -x-> <curr>
-                } else if self.anchor_next.is_null() {
-                    // <anchor> -> <next> -x-> <prev> -x-> <curr>, anchor_next = null
-                    Snapshot::swap(&mut self.next, &mut self.anchor_next);
-                    // <anchor> -> <anchor_next> -x-> <prev> -x-> <curr>
-                }
-                continue;
-            }
-
-            match curr_node.key.cmp(key) {
-                Less => {
-                    Snapshot::swap(&mut self.prev, &mut self.curr);
+            if self.next.tag() == 0 {
+                if curr_node.key < *key {
                     Snapshot::swap(&mut self.curr, &mut self.next);
+                    Snapshot::swap(&mut self.next, &mut self.prev);
                     self.anchor.clear();
                     self.anchor_next.clear();
+                } else {
+                    break curr_node.key == *key;
                 }
-                Equal => break true,
-                Greater => break false,
+            } else {
+                // We add a 0 tag here so that `self.curr`s tag is always 0.
+                self.next.set_tag(0);
+                if self.anchor.is_null() {
+                    Snapshot::swap(&mut self.anchor, &mut self.prev);
+                } else if self.anchor_next.is_null() {
+                    Snapshot::swap(&mut self.anchor_next, &mut self.prev);
+                }
+                Snapshot::swap(&mut self.curr, &mut self.next);
+                Snapshot::swap(&mut self.next, &mut self.prev);
             }
         };
 
@@ -190,16 +175,14 @@ impl<K: Ord, V> Cursor<K, V> {
             )
             .map_err(|_| ())?;
 
-        unsafe { self.prev.deref() }
-            .next
-            .compare_exchange(
-                &self.curr,
-                self.next.counted(),
-                Ordering::Release,
-                Ordering::Relaxed,
-            )
-            .map(|_| ())
-            .map_err(|_| ())
+        let _ = unsafe { self.prev.deref() }.next.compare_exchange(
+            &self.curr,
+            self.next.counted(),
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+
+        Ok(())
     }
 }
 
