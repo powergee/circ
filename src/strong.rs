@@ -3,16 +3,17 @@ use std::{
     fmt::{Debug, Formatter, Pointer},
     hash::{Hash, Hasher},
     marker::PhantomData,
-    mem::{forget, size_of, take, transmute},
+    mem::{forget, size_of, swap, take},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
 use atomic::Atomic;
+use membarrier::light_membarrier;
 use static_assertions::const_assert;
 
-use crate::ebr_impl::{global_epoch, Guard, Tagged};
-use crate::utils::{try_ird_with_raw, DisposeContext, Raw, RcInner};
-use crate::{Weak, WeakSnapshot};
+use crate::hp_impl::{with_thread, HazardPointer, Tagged};
+use crate::utils::{Raw, RcInner};
+use crate::Weak;
 
 /// A common trait for reference-counted object types.
 ///
@@ -22,7 +23,8 @@ use crate::{Weak, WeakSnapshot};
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
+/// // TODO: revise examples in the doc
 /// use circ::{AtomicRc, RcObject, Rc, EdgeTaker};
 ///
 /// // A simple singly linked list node.
@@ -67,21 +69,25 @@ pub unsafe trait RcObject: Sized {
     fn pop_edges(&mut self, out: &mut EdgeTaker<'_>);
 }
 
+#[allow(unused)]
 pub(crate) struct TryIRD {
     rc: Raw<()>,
-    ird: unsafe fn(Raw<()>, DisposeContext, u32),
+    ird: unsafe fn(Raw<()>),
 }
 
+#[allow(unused)]
 impl TryIRD {
-    pub(crate) unsafe fn try_ird(self, ctx: DisposeContext<'_>, succ_epoch: u32) {
-        (self.ird)(self.rc, ctx, succ_epoch)
+    pub(crate) unsafe fn try_ird() {
+        todo!()
     }
 }
 
+#[allow(unused)]
 pub struct EdgeTaker<'r> {
     popped: &'r mut Vec<TryIRD>,
 }
 
+#[allow(unused)]
 impl<'r> EdgeTaker<'r> {
     pub(crate) fn new(popped: &'r mut Vec<TryIRD>) -> Self {
         Self { popped }
@@ -89,12 +95,8 @@ impl<'r> EdgeTaker<'r> {
 
     /// Takes an underlying [`Rc`] from `outgoing` edge, and stores it in a local buffer.
     /// The taken [`Rc`]s will be efficiently destructed by CIRC.
-    pub fn take<T: RcObject>(&mut self, outgoing: &mut impl OwnRc<T>) {
-        let rc = outgoing.take().into_raw();
-        self.popped.push(TryIRD {
-            rc: unsafe { transmute::<Raw<T>, Raw<()>>(rc) },
-            ird: try_ird_with_raw::<T>,
-        });
+    pub fn take<T: RcObject>(&mut self, _outgoing: &mut impl OwnRc<T>) {
+        todo!()
     }
 }
 
@@ -102,16 +104,6 @@ impl<'r> EdgeTaker<'r> {
 pub trait OwnRc<T: RcObject> {
     /// Takes an underlying [`Rc`] from this object, leaving a null pointer.
     fn take(&mut self) -> Rc<T>;
-}
-
-impl<T> Tagged<RcInner<T>> {
-    fn with_timestamp(self) -> Self {
-        if self.is_null() {
-            self
-        } else {
-            self.with_high_tag(global_epoch())
-        }
-    }
 }
 
 /// Result of a failed `compare_exchange` operation.
@@ -171,8 +163,24 @@ impl<T: RcObject> AtomicRc<T> {
     ///
     /// Panics if `order` is `Release` or `AcqRel`.
     #[inline]
-    pub fn load<'g>(&self, order: Ordering, guard: &'g Guard) -> Snapshot<'g, T> {
-        Snapshot::from_raw(self.link.load(order), guard)
+    pub fn load<'g>(&self, slot: &mut Snapshot<T>, order: Ordering) {
+        let mut ptr = self.link.load(order);
+        loop {
+            slot.ptr = ptr;
+            slot.shield.protect_raw(ptr.as_ptr());
+            light_membarrier();
+
+            let new_ptr = self.link.load(Ordering::Acquire);
+            if new_ptr.ptr_eq(ptr) {
+                break;
+            }
+            ptr = new_ptr;
+        }
+    }
+
+    #[inline]
+    pub fn load_raw(&self, order: Ordering) -> Raw<T> {
+        self.link.load(order)
     }
 
     /// Stores an [`Rc`] pointer into this `AtomicRc`.
@@ -180,15 +188,15 @@ impl<T: RcObject> AtomicRc<T> {
     /// This method takes an [`Ordering`] argument which describes the memory ordering of
     /// this operation.
     #[inline]
-    pub fn store(&self, ptr: Rc<T>, order: Ordering, guard: &Guard) {
+    pub fn store(&self, ptr: Rc<T>, order: Ordering) {
         let new_ptr = ptr.ptr;
-        let old_ptr = self.link.swap(new_ptr.with_timestamp(), order);
+        let old_ptr = self.link.swap(new_ptr, order);
         // Skip decrementing a strong count of the inserted pointer.
         forget(ptr);
         unsafe {
             // Did not use `Rc::drop`, to reuse the given `guard`.
-            if let Some(cnt) = old_ptr.as_raw().as_mut() {
-                RcInner::decrement_strong(cnt, 1, Some(guard));
+            if let Some(cnt) = old_ptr.as_ptr().as_mut() {
+                RcInner::decrement_strong(cnt, 1, None);
             }
         }
     }
@@ -201,7 +209,7 @@ impl<T: RcObject> AtomicRc<T> {
     #[inline(always)]
     pub fn swap(&self, new: Rc<T>, order: Ordering) -> Rc<T> {
         let new_ptr = new.into_raw();
-        let old_ptr = self.link.swap(new_ptr.with_timestamp(), order);
+        let old_ptr = self.link.swap(new_ptr, order);
         Rc::from_raw(old_ptr)
     }
 
@@ -222,36 +230,29 @@ impl<T: RcObject> AtomicRc<T> {
     /// `Relaxed`. The failure ordering can only be `SeqCst`, `Acquire` or `Relaxed`
     /// and must be equivalent to or weaker than the success ordering.
     #[inline(always)]
-    pub fn compare_exchange<'g>(
+    pub fn compare_exchange<P>(
         &self,
-        expected: Snapshot<'g, T>,
+        expected: P,
         desired: Rc<T>,
         success: Ordering,
         failure: Ordering,
-        guard: &'g Guard,
-    ) -> Result<Rc<T>, CompareExchangeError<Rc<T>, Snapshot<'g, T>>> {
-        let mut expected_raw = expected.ptr;
-        let desired_raw = desired.ptr.with_timestamp();
-        loop {
-            match self
-                .link
-                .compare_exchange(expected_raw, desired_raw, success, failure)
-            {
-                Ok(_) => {
-                    // Skip decrementing a strong count of the inserted pointer.
-                    forget(desired);
-                    let rc = Rc::from_raw(expected_raw);
-                    return Ok(rc);
-                }
-                Err(current_raw) => {
-                    if current_raw.ptr_eq(expected_raw) {
-                        expected_raw = current_raw;
-                    } else {
-                        let current = Snapshot::from_raw(current_raw, guard);
-                        return Err(CompareExchangeError { desired, current });
-                    }
-                }
+    ) -> Result<Rc<T>, CompareExchangeError<Rc<T>, Raw<T>>>
+    where
+        P: StrongPtr<T>,
+    {
+        let expected_raw = expected.as_raw();
+        let desired_raw = desired.as_raw();
+        match self
+            .link
+            .compare_exchange(expected_raw, desired_raw, success, failure)
+        {
+            Ok(_) => {
+                // Skip decrementing a strong count of the inserted pointer.
+                forget(desired);
+                let rc = Rc::from_raw(expected_raw);
+                Ok(rc)
             }
+            Err(current) => Err(CompareExchangeError { desired, current }),
         }
     }
 
@@ -274,36 +275,29 @@ impl<T: RcObject> AtomicRc<T> {
     /// `Relaxed`. The failure ordering can only be `SeqCst`, `Acquire` or `Relaxed`
     /// and must be equivalent to or weaker than the success ordering.
     #[inline(always)]
-    pub fn compare_exchange_weak<'g>(
+    pub fn compare_exchange_weak<P>(
         &self,
-        expected: Snapshot<'g, T>,
+        expected: P,
         desired: Rc<T>,
         success: Ordering,
         failure: Ordering,
-        guard: &'g Guard,
-    ) -> Result<Rc<T>, CompareExchangeError<Rc<T>, Snapshot<'g, T>>> {
-        let mut expected_raw = expected.ptr;
-        let desired_raw = desired.ptr.with_timestamp();
-        loop {
-            match self
-                .link
-                .compare_exchange_weak(expected_raw, desired_raw, success, failure)
-            {
-                Ok(_) => {
-                    // Skip decrementing a strong count of the inserted pointer.
-                    forget(desired);
-                    let rc = Rc::from_raw(expected_raw);
-                    return Ok(rc);
-                }
-                Err(current_raw) => {
-                    if current_raw.ptr_eq(expected_raw) {
-                        expected_raw = current_raw;
-                    } else {
-                        let current = Snapshot::from_raw(current_raw, guard);
-                        return Err(CompareExchangeError { desired, current });
-                    }
-                }
+    ) -> Result<Rc<T>, CompareExchangeError<Rc<T>, Raw<T>>>
+    where
+        P: StrongPtr<T>,
+    {
+        let expected_raw = expected.as_raw();
+        let desired_raw = desired.as_raw();
+        match self
+            .link
+            .compare_exchange_weak(expected_raw, desired_raw, success, failure)
+        {
+            Ok(_) => {
+                // Skip decrementing a strong count of the inserted pointer.
+                forget(desired);
+                let rc = Rc::from_raw(expected_raw);
+                Ok(rc)
             }
+            Err(current) => Err(CompareExchangeError { desired, current }),
         }
     }
 
@@ -331,33 +325,27 @@ impl<T: RcObject> AtomicRc<T> {
     /// [`AtomicRc::compare_exchange`] subsumes this method, but it is more efficient because it
     /// does not require [`Rc`] as `desired`.
     #[inline]
-    pub fn compare_exchange_tag<'g>(
+    pub fn compare_exchange_tag<P>(
         &self,
-        expected: Snapshot<'g, T>,
+        expected: P,
         desired_tag: usize,
         success: Ordering,
         failure: Ordering,
-        guard: &'g Guard,
-    ) -> Result<Snapshot<'g, T>, CompareExchangeError<Snapshot<'g, T>, Snapshot<'g, T>>> {
-        let mut expected_raw = expected.ptr;
-        let desired_raw = expected_raw.with_tag(desired_tag).with_timestamp();
-        loop {
-            match self
-                .link
-                .compare_exchange(expected_raw, desired_raw, success, failure)
-            {
-                Ok(current_raw) => return Ok(Snapshot::from_raw(current_raw, guard)),
-                Err(current_raw) => {
-                    if current_raw.ptr_eq(expected_raw) {
-                        expected_raw = current_raw;
-                    } else {
-                        return Err(CompareExchangeError {
-                            desired: Snapshot::from_raw(desired_raw, guard),
-                            current: Snapshot::from_raw(current_raw, guard),
-                        });
-                    }
-                }
-            }
+    ) -> Result<Raw<T>, CompareExchangeError<Raw<T>, Raw<T>>>
+    where
+        P: StrongPtr<T>,
+    {
+        let expected_raw = expected.as_raw();
+        let desired_raw = expected_raw.with_tag(desired_tag);
+        match self
+            .link
+            .compare_exchange(expected_raw, desired_raw, success, failure)
+        {
+            Ok(current_raw) => Ok(current_raw),
+            Err(current_raw) => Err(CompareExchangeError {
+                desired: desired_raw,
+                current: current_raw,
+            }),
         }
     }
 
@@ -389,7 +377,7 @@ impl<T: RcObject> OwnRc<T> for AtomicRc<T> {
 impl<T: RcObject> Drop for AtomicRc<T> {
     #[inline(always)]
     fn drop(&mut self) {
-        let ptr = (*self.link.get_mut()).as_raw();
+        let ptr = (*self.link.get_mut()).as_ptr();
         unsafe {
             if let Some(cnt) = ptr.as_mut() {
                 RcInner::decrement_strong(cnt, 1, None);
@@ -457,7 +445,7 @@ impl<T: RcObject> Clone for Rc<T> {
             _marker: PhantomData,
         };
         unsafe {
-            if let Some(cnt) = rc.ptr.as_raw().as_ref() {
+            if let Some(cnt) = rc.ptr.as_ptr().as_ref() {
                 cnt.increment_strong();
             }
         }
@@ -533,7 +521,7 @@ impl<T: RcObject> Rc<T> {
     /// read-modify-write operations.
     #[inline]
     pub fn weak_many<const N: usize>(&self) -> [Weak<T>; N] {
-        if let Some(cnt) = unsafe { self.ptr.as_raw().as_ref() } {
+        if let Some(cnt) = unsafe { self.ptr.as_ptr().as_ref() } {
             cnt.increment_weak(N as u32);
         }
         array::from_fn(|_| Weak::null())
@@ -561,37 +549,16 @@ impl<T: RcObject> Rc<T> {
         new_ptr
     }
 
-    /// Consumes this pointer and release a strong reference count it was owning.
-    ///
-    /// This method is more efficient than just `Drop`ing the pointer. The `Drop` method
-    /// checks whether the current thread is pinned and pin the thread if it is not.
-    /// However, this method skips that procedure as it already requires `Guard` as an argument.
-    #[inline]
-    pub fn finalize(self, guard: &Guard) {
-        unsafe {
-            if let Some(cnt) = self.ptr.as_raw().as_mut() {
-                RcInner::decrement_strong(cnt, 1, Some(guard));
-            }
-        }
-        forget(self);
-    }
-
     /// Creates a [`Weak`] pointer by incrementing the weak reference counter.
     #[inline]
     pub fn downgrade(&self) -> Weak<T> {
         unsafe {
-            if let Some(cnt) = self.ptr.as_raw().as_ref() {
+            if let Some(cnt) = self.ptr.as_ptr().as_ref() {
                 cnt.increment_weak(1);
                 return Weak::from_raw(self.ptr);
             }
         }
         Weak::from_raw(self.ptr)
-    }
-
-    /// Creates a [`Snapshot`] pointer to the same object.
-    #[inline]
-    pub fn snapshot<'g>(&self, guard: &'g Guard) -> Snapshot<'g, T> {
-        Snapshot::from_raw(self.ptr, guard)
     }
 
     /// Dereferences the pointer and returns an immutable reference.
@@ -662,8 +629,8 @@ impl<T: RcObject> OwnRc<T> for Rc<T> {
     }
 }
 
-impl<'g, T: RcObject> From<Snapshot<'g, T>> for Rc<T> {
-    fn from(value: Snapshot<'g, T>) -> Self {
+impl<T: RcObject> From<&Snapshot<T>> for Rc<T> {
+    fn from(value: &Snapshot<T>) -> Self {
         value.counted()
     }
 }
@@ -695,7 +662,7 @@ impl<T: RcObject> Drop for Rc<T> {
     #[inline(always)]
     fn drop(&mut self) {
         unsafe {
-            if let Some(cnt) = self.ptr.as_raw().as_mut() {
+            if let Some(cnt) = self.ptr.as_ptr().as_mut() {
                 RcInner::decrement_strong(cnt, 1, None);
             }
         }
@@ -760,10 +727,10 @@ impl<T: RcObject> NewRcIter<T> {
     /// It decreases the strong reference counter as the remaining number of [`Rc`]s that are not
     /// generated yet.
     #[inline]
-    pub fn abort(self, guard: &Guard) {
+    pub fn abort(self) {
         if self.remain > 0 {
             unsafe {
-                RcInner::decrement_strong(self.ptr.as_raw(), self.remain as _, Some(guard));
+                RcInner::decrement_strong(self.ptr.as_ptr(), self.remain as _, None);
             };
         }
         forget(self);
@@ -775,7 +742,7 @@ impl<T: RcObject> Drop for NewRcIter<T> {
     fn drop(&mut self) {
         if self.remain > 0 {
             unsafe {
-                RcInner::decrement_strong(self.ptr.as_raw(), self.remain as _, None);
+                RcInner::decrement_strong(self.ptr.as_ptr(), self.remain as _, None);
             };
         }
     }
@@ -785,60 +752,61 @@ impl<T: RcObject> Drop for NewRcIter<T> {
 ///
 /// Unlike [`Rc`] pointer, this pointer does not own a strong reference count by itself.
 /// This pointer is valid for use only during the lifetime of EBR guard `'g`.
-pub struct Snapshot<'g, T> {
+pub struct Snapshot<T> {
     pub(crate) ptr: Raw<T>,
-    pub(crate) _marker: PhantomData<&'g T>,
+    pub(crate) shield: HazardPointer,
 }
 
-impl<T> Clone for Snapshot<'_, T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<T> Copy for Snapshot<'_, T> {}
-
-impl<'g, T: RcObject> Snapshot<'g, T> {
+impl<T: RcObject> Snapshot<T> {
     /// Returns `true` if the pointer is null ignoring the tag.
     #[inline(always)]
     pub fn is_null(&self) -> bool {
         self.ptr.is_null()
     }
 
+    /// Protects the given `Rc` pointer.
+    #[inline]
+    pub fn protect(&mut self, rc: &Rc<T>) {
+        self.ptr = rc.ptr;
+        self.shield.protect_raw(rc.ptr.as_ptr());
+        light_membarrier();
+    }
+
     /// Creates an [`Rc`] pointer by incrementing the strong reference counter.
     #[inline]
-    pub fn counted(self) -> Rc<T> {
+    pub fn counted(&self) -> Rc<T> {
         let rc = Rc::from_raw(self.ptr);
-        unsafe {
-            if let Some(cnt) = rc.ptr.as_raw().as_ref() {
-                cnt.increment_strong();
-            }
+        if let Some(cnt) = unsafe { self.ptr.as_ptr().as_ref() } {
+            cnt.increment_strong();
         }
         rc
     }
 
-    /// Converts to `WeakSnapshot`. This does not touch the reference counter.
     #[inline]
-    pub fn downgrade(self) -> WeakSnapshot<'g, T> {
-        WeakSnapshot {
-            ptr: self.ptr,
-            _marker: PhantomData,
+    pub fn weak(&self) -> Weak<T> {
+        let weak = Weak::from_raw(self.ptr);
+        if let Some(ptr) = unsafe { self.ptr.as_ptr().as_ref() } {
+            ptr.increment_weak(1);
         }
+        weak
     }
 
     /// Returns the tag stored within the pointer.
     #[inline(always)]
-    pub fn tag(self) -> usize {
+    pub fn tag(&self) -> usize {
         self.ptr.tag()
+    }
+
+    #[inline]
+    pub fn set_tag(&mut self, tag: usize) {
+        self.ptr = self.ptr.with_tag(tag);
     }
 
     /// Returns the same pointer, but tagged with `tag`. `tag` is truncated to be fit into the
     /// unused bits of the pointer to `T`.
     #[inline]
-    pub fn with_tag(self, tag: usize) -> Self {
-        let mut result = self;
-        result.ptr = result.ptr.with_tag(tag);
-        result
+    pub fn with_tag(&self, tag: usize) -> TaggedSnapshot<'_, T> {
+        TaggedSnapshot { inner: self, tag }
     }
 
     /// Dereferences the pointer and returns an immutable reference.
@@ -849,7 +817,7 @@ impl<'g, T: RcObject> Snapshot<'g, T> {
     ///
     /// The pointer must be a valid memory location to dereference.
     #[inline]
-    pub unsafe fn deref(self) -> &'g T {
+    pub unsafe fn deref(&self) -> &T {
         self.ptr.deref().data()
     }
 
@@ -862,13 +830,13 @@ impl<'g, T: RcObject> Snapshot<'g, T> {
     /// The pointer must be a valid memory location to dereference and
     /// other threads must not have references to the object.
     #[inline]
-    pub unsafe fn deref_mut(mut self) -> &'g mut T {
+    pub unsafe fn deref_mut(&mut self) -> &mut T {
         self.ptr.deref_mut().data_mut()
     }
 
     /// Dereferences the pointer and returns an immutable reference if it is not null.
     #[inline]
-    pub fn as_ref(self) -> Option<&'g T> {
+    pub fn as_ref(&self) -> Option<&T> {
         if self.ptr.is_null() {
             None
         } else {
@@ -882,7 +850,7 @@ impl<'g, T: RcObject> Snapshot<'g, T> {
     ///
     /// Other threads must not have references to the object.
     #[inline]
-    pub unsafe fn as_mut(self) -> Option<&'g mut T> {
+    pub unsafe fn as_mut(&mut self) -> Option<&mut T> {
         if self.ptr.is_null() {
             None
         } else {
@@ -902,60 +870,64 @@ impl<'g, T: RcObject> Snapshot<'g, T> {
     }
 }
 
-impl<'g, T> Snapshot<'g, T> {
+impl<T> Snapshot<T> {
     /// Constructs a new `Snapshot` representing a null pointer.
     #[inline(always)]
     pub fn null() -> Self {
         Self {
             ptr: Tagged::null(),
-            _marker: PhantomData,
+            shield: with_thread(|t| HazardPointer::new(t)),
         }
     }
 
     #[inline]
-    pub(crate) fn from_raw(acquired: Raw<T>, _: &'g Guard) -> Self {
-        Self {
-            ptr: acquired,
-            _marker: PhantomData,
-        }
+    pub fn swap(a: &mut Self, b: &mut Self) {
+        HazardPointer::swap(&mut a.shield, &mut b.shield);
+        swap(&mut a.ptr, &mut b.ptr);
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.ptr = Raw::null();
+        self.shield.reset_protection();
     }
 }
 
-impl<T: RcObject> Default for Snapshot<'_, T> {
+impl<T: RcObject> Default for Snapshot<T> {
     #[inline]
     fn default() -> Self {
         Self::null()
     }
 }
 
-impl<T: RcObject + PartialEq> PartialEq for Snapshot<'_, T> {
+impl<T: RcObject + PartialEq> PartialEq for Snapshot<T> {
     #[inline(always)]
     fn eq(&self, other: &Self) -> bool {
         self.as_ref() == other.as_ref()
     }
 }
 
-impl<T: RcObject + Eq> Eq for Snapshot<'_, T> {}
+impl<T: RcObject + Eq> Eq for Snapshot<T> {}
 
-impl<T: RcObject + Hash> Hash for Snapshot<'_, T> {
+impl<T: RcObject + Hash> Hash for Snapshot<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.as_ref().hash(state);
     }
 }
 
-impl<T: RcObject + PartialOrd> PartialOrd for Snapshot<'_, T> {
+impl<T: RcObject + PartialOrd> PartialOrd for Snapshot<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         self.as_ref().partial_cmp(&other.as_ref())
     }
 }
 
-impl<T: RcObject + Ord> Ord for Snapshot<'_, T> {
+impl<T: RcObject + Ord> Ord for Snapshot<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.as_ref().cmp(&other.as_ref())
     }
 }
 
-impl<T: RcObject + Debug> Debug for Snapshot<'_, T> {
+impl<T: RcObject + Debug> Debug for Snapshot<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         if let Some(cnt) = self.as_ref() {
             f.debug_tuple("RcObject").field(cnt).finish()
@@ -965,8 +937,62 @@ impl<T: RcObject + Debug> Debug for Snapshot<'_, T> {
     }
 }
 
-impl<T: RcObject> Pointer for Snapshot<'_, T> {
+impl<T: RcObject> Pointer for Snapshot<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         Pointer::fmt(&self.ptr, f)
+    }
+}
+
+/// A reference of a [`Snapshot`] with a overwriting tag value.
+pub struct TaggedSnapshot<'s, T> {
+    pub(crate) inner: &'s Snapshot<T>,
+    pub(crate) tag: usize,
+}
+
+pub trait StrongPtr<T: RcObject> {
+    /// Consumes `self` and constructs a [`Rc`] pointing to the same object.
+    ///
+    /// If `self` is already [`Rc`], it will not touch the reference count.
+    fn into_rc(self) -> Rc<T>;
+    fn as_raw(&self) -> Raw<T>;
+}
+
+impl<T: RcObject> StrongPtr<T> for Rc<T> {
+    fn into_rc(self) -> Rc<T> {
+        self
+    }
+
+    fn as_raw(&self) -> Raw<T> {
+        self.ptr
+    }
+}
+
+impl<T: RcObject> StrongPtr<T> for Snapshot<T> {
+    fn into_rc(self) -> Rc<T> {
+        self.counted()
+    }
+
+    fn as_raw(&self) -> Raw<T> {
+        self.ptr
+    }
+}
+
+impl<T: RcObject> StrongPtr<T> for &Snapshot<T> {
+    fn into_rc(self) -> Rc<T> {
+        self.counted()
+    }
+
+    fn as_raw(&self) -> Raw<T> {
+        self.ptr
+    }
+}
+
+impl<'s, T: RcObject> StrongPtr<T> for TaggedSnapshot<'s, T> {
+    fn into_rc(self) -> Rc<T> {
+        self.inner.counted()
+    }
+
+    fn as_raw(&self) -> Raw<T> {
+        self.inner.ptr.with_tag(self.tag)
     }
 }

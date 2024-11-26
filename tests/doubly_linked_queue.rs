@@ -3,31 +3,25 @@
 
 use std::sync::atomic::Ordering;
 
-use circ::{AtomicRc, EdgeTaker, Guard, Rc, RcObject, Snapshot, Weak};
+use circ::{AtomicRc, AtomicWeak, Rc, RcObject, Snapshot};
 use crossbeam_utils::CachePadded;
 
-pub struct Output<'g, T> {
-    found: Snapshot<'g, Node<T>>,
-}
-
-impl<'g, T> Output<'g, T> {
-    pub fn output(&self) -> &T {
-        self.found
-            .as_ref()
-            .map(|node| node.item.as_ref().unwrap())
-            .unwrap()
-    }
+#[derive(Default)]
+pub struct Holder<T> {
+    pri: Snapshot<Node<T>>,
+    sub: Snapshot<Node<T>>,
+    new: Snapshot<Node<T>>,
 }
 
 struct Node<T> {
     item: Option<T>,
-    prev: Weak<Node<T>>,
+    prev: AtomicWeak<Node<T>>,
     next: CachePadded<AtomicRc<Node<T>>>,
 }
 
 unsafe impl<T> RcObject for Node<T> {
-    fn pop_edges(&mut self, out: &mut EdgeTaker<'_>) {
-        out.take(&mut *self.next);
+    fn pop_edges(&mut self, _out: &mut circ::EdgeTaker<'_>) {
+        todo!()
     }
 }
 
@@ -35,7 +29,7 @@ impl<T> Node<T> {
     fn sentinel() -> Self {
         Self {
             item: None,
-            prev: Weak::null(),
+            prev: AtomicWeak::null(),
             next: CachePadded::new(AtomicRc::null()),
         }
     }
@@ -43,19 +37,27 @@ impl<T> Node<T> {
     fn new(item: T) -> Self {
         Self {
             item: Some(item),
-            prev: Weak::null(),
+            prev: AtomicWeak::null(),
             next: CachePadded::new(AtomicRc::null()),
         }
     }
 }
 
-pub struct DLQueue<T: Sync + Send> {
+unsafe impl<T: Sync> Sync for Node<T> {}
+unsafe impl<T: Sync> Send for Node<T> {}
+
+pub struct DoubleLink<T: Sync + Send> {
     head: CachePadded<AtomicRc<Node<T>>>,
     tail: CachePadded<AtomicRc<Node<T>>>,
 }
 
-impl<T: Sync + Send> DLQueue<T> {
-    #[inline]
+impl<T: Sync + Send> Default for DoubleLink<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Sync + Send> DoubleLink<T> {
     pub fn new() -> Self {
         let sentinel = Rc::new(Node::sentinel());
         // Note: In RC-based SMRs(CDRC, CIRC, ...), `sentinel.prev` MUST NOT be set to the self.
@@ -66,37 +68,42 @@ impl<T: Sync + Send> DLQueue<T> {
         }
     }
 
-    #[inline]
-    pub fn enqueue(&self, item: T, guard: &Guard) {
-        let [mut node, sub] = Rc::new_many(Node::new(item));
+    pub fn enqueue(&self, item: T, holder: &mut Holder<T>) {
+        let new = &mut holder.new;
+        let ltail = &mut holder.pri;
+        let lprev = &mut holder.sub;
+
+        let mut node = Rc::new(Node::new(item));
+        new.protect(&node);
 
         loop {
-            let ltail = self.tail.load(Ordering::Acquire, guard);
-            unsafe { node.deref_mut() }.prev = ltail.downgrade().counted();
+            self.tail.load(ltail, Ordering::Acquire);
+            node.as_ref()
+                .unwrap()
+                .prev
+                .store(ltail.weak(), Ordering::Relaxed);
 
             // Try to help the previous enqueue to complete.
-            if let Some(lprev) = ltail
+            ltail
                 .as_ref()
                 .unwrap()
                 .prev
-                .snapshot(guard)
-                .upgrade()
-                .and_then(Snapshot::as_ref)
-            {
-                if lprev.next.load(Ordering::SeqCst, guard).is_null() {
-                    lprev.next.store(ltail.counted(), Ordering::Relaxed, guard);
+                .try_load(lprev, Ordering::SeqCst);
+            if let Some(lprev) = lprev.as_ref() {
+                if lprev.next.load_raw(Ordering::SeqCst).is_null() {
+                    lprev.next.store(ltail.counted(), Ordering::Relaxed);
                 }
             }
             match self
                 .tail
-                .compare_exchange(ltail, node, Ordering::SeqCst, Ordering::SeqCst, guard)
+                .compare_exchange(&*ltail, node, Ordering::SeqCst, Ordering::SeqCst)
             {
                 Ok(_) => {
                     ltail
                         .as_ref()
                         .unwrap()
                         .next
-                        .store(sub, Ordering::Release, guard);
+                        .store(new.counted(), Ordering::Release);
                     return;
                 }
                 Err(e) => node = e.desired,
@@ -104,11 +111,13 @@ impl<T: Sync + Send> DLQueue<T> {
         }
     }
 
-    #[inline]
-    pub fn dequeue<'g>(&self, guard: &'g Guard) -> Option<Output<'g, T>> {
+    pub fn dequeue<'h>(&self, holder: &'h mut Holder<T>) -> Option<&'h T> {
+        let lhead = &mut holder.pri;
+        let lnext = &mut holder.sub;
+
         loop {
-            let lhead = self.head.load(Ordering::Acquire, guard);
-            let lnext = lhead.as_ref().unwrap().next.load(Ordering::Acquire, guard);
+            self.head.load(lhead, Ordering::Acquire);
+            lhead.as_ref().unwrap().next.load(lnext, Ordering::Acquire);
             // Check if this queue is empty.
             if lnext.is_null() {
                 return None;
@@ -116,16 +125,10 @@ impl<T: Sync + Send> DLQueue<T> {
 
             if self
                 .head
-                .compare_exchange(
-                    lhead,
-                    lnext.counted(),
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                    guard,
-                )
+                .compare_exchange(&*lhead, lnext.counted(), Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                return Some(Output { found: lnext });
+                return Some(lnext.as_ref().and_then(|node| node.item.as_ref()).unwrap());
             }
         }
     }
@@ -135,22 +138,21 @@ impl<T: Sync + Send> DLQueue<T> {
 mod test {
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use super::DLQueue;
-    use circ::cs;
+    use super::{DoubleLink, Holder};
     use crossbeam_utils::thread::scope;
 
     #[test]
     fn simple() {
-        let queue = DLQueue::new();
-        let guard = &cs();
-        assert!(queue.dequeue(guard).is_none());
-        queue.enqueue(1, guard);
-        queue.enqueue(2, guard);
-        queue.enqueue(3, guard);
-        assert_eq!(*queue.dequeue(guard).unwrap().output(), 1);
-        assert_eq!(*queue.dequeue(guard).unwrap().output(), 2);
-        assert_eq!(*queue.dequeue(guard).unwrap().output(), 3);
-        assert!(queue.dequeue(guard).is_none());
+        let queue = DoubleLink::new();
+        let holder = &mut Holder::default();
+        assert!(queue.dequeue(holder).is_none());
+        queue.enqueue(1, holder);
+        queue.enqueue(2, holder);
+        queue.enqueue(3, holder);
+        assert_eq!(*queue.dequeue(holder).unwrap(), 1);
+        assert_eq!(*queue.dequeue(holder).unwrap(), 2);
+        assert_eq!(*queue.dequeue(holder).unwrap(), 3);
+        assert!(queue.dequeue(holder).is_none());
     }
 
     #[test]
@@ -158,7 +160,7 @@ mod test {
         const THREADS: usize = 100;
         const ELEMENTS_PER_THREAD: usize = 10000;
 
-        let queue = DLQueue::new();
+        let queue = DoubleLink::new();
         let mut found = Vec::new();
         found.resize_with(THREADS * ELEMENTS_PER_THREAD, || AtomicU32::new(0));
 
@@ -166,8 +168,9 @@ mod test {
             for t in 0..THREADS {
                 let queue = &queue;
                 s.spawn(move |_| {
+                    let holder = &mut Holder::default();
                     for i in 0..ELEMENTS_PER_THREAD {
-                        queue.enqueue((t * ELEMENTS_PER_THREAD + i).to_string(), &cs());
+                        queue.enqueue((t * ELEMENTS_PER_THREAD + i).to_string(), holder);
                     }
                 });
             }
@@ -179,10 +182,9 @@ mod test {
                 let queue = &queue;
                 let found = &found;
                 s.spawn(move |_| {
+                    let holder = &mut Holder::default();
                     for _ in 0..ELEMENTS_PER_THREAD {
-                        let guard = cs();
-                        let output = queue.dequeue(&guard).unwrap();
-                        let res = output.output();
+                        let res = queue.dequeue(holder).unwrap();
                         assert_eq!(
                             found[res.parse::<usize>().unwrap()].fetch_add(1, Ordering::Relaxed),
                             0

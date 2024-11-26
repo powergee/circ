@@ -2,7 +2,7 @@
 //! (<https://www.cl.cam.ac.uk/research/srg/netos/papers/2001-caslists.pdf>).
 
 use atomic::Ordering;
-use circ::{AtomicRc, EdgeTaker, Guard, Rc, RcObject, Snapshot};
+use circ::{AtomicRc, EdgeTaker, Rc, RcObject, Snapshot};
 
 use std::cmp::Ordering::{Equal, Greater, Less};
 
@@ -57,121 +57,149 @@ where
     }
 }
 
-struct Cursor<'g, K, V> {
+#[derive(Default)]
+pub struct Cursor<K, V> {
     // The previous node of `curr`.
-    prev: Snapshot<'g, Node<K, V>>,
+    prev: Snapshot<Node<K, V>>,
     // Tag of `curr` should always be zero so when `curr` is stored in a `prev`, we don't store a
     // tagged pointer and cause cleanup to fail.
-    curr: Snapshot<'g, Node<K, V>>,
+    curr: Snapshot<Node<K, V>>,
+    next: Snapshot<Node<K, V>>,
+
+    // Additional fields for HList.
+    anchor: Snapshot<Node<K, V>>,
+    anchor_next: Snapshot<Node<K, V>>,
 }
 
-impl<'g, K: Ord, V> Cursor<'g, K, V> {
-    /// Creates a cursor.
-    fn new(head: &AtomicRc<Node<K, V>>, guard: &'g Guard) -> Self {
-        let prev = head.load(Ordering::Relaxed, guard);
-        let curr = prev.as_ref().unwrap().next.load(Ordering::Acquire, guard);
-        Self { prev, curr }
+impl<K: Ord, V> Cursor<K, V> {
+    /// Initializes a cursor.
+    fn initialize(&mut self, head: &AtomicRc<Node<K, V>>) {
+        head.load(&mut self.prev, Ordering::Relaxed);
+        self.prev
+            .as_ref()
+            .unwrap()
+            .next
+            .load(&mut self.curr, Ordering::Acquire);
+        self.anchor.clear();
+        self.anchor_next.clear();
     }
 
     /// Clean up a chain of logically removed nodes in each traversal.
     #[inline]
-    fn find_harris(&mut self, key: &K, guard: &'g Guard) -> Result<Option<&'g V>, ()> {
-        // Finding phase
-        // - cursor.curr: first untagged node w/ key >= search key (4)
-        // - cursor.prev: the ref of .next in previous untagged node (1 -> 2)
-        // 1 -> 2 -x-> 3 -x-> 4 -> 5 -> ∅  (search key: 4)
-        let mut prev_next = self.curr;
+    fn find_harris(&mut self, key: &K) -> Result<bool, ()> {
         let found = loop {
+            // * 0 deleted: <prev> -> <curr>
+            // * 1 deleted: <anchor> -> <prev> -x-> <curr>
+            // * 2 deleted: <anchor> -> <anchor_next> -x-> <prev> -x-> <curr>
+            // * n deleted: <anchor> -> <anchor_next> -x> (...) -x-> <prev> -x-> <curr>
             let Some(curr_node) = self.curr.as_ref() else {
-                break None;
+                break false;
             };
-            let next = curr_node.next.load(Ordering::Acquire, guard);
+            curr_node.next.load(&mut self.next, Ordering::Acquire);
 
-            if next.tag() != 0 {
+            if self.next.tag() != 0 {
                 // We add a 0 tag here so that `self.curr`s tag is always 0.
-                self.curr = next.with_tag(0);
+                self.next.set_tag(0);
+
+                // <prev> -?-> <curr> -x-> <next>
+                Snapshot::swap(&mut self.next, &mut self.curr);
+                // <prev> -?-> <next> -x-> <curr>
+                Snapshot::swap(&mut self.next, &mut self.prev);
+                // <next> -?-> <prev> -x-> <curr>
+
+                if self.anchor.is_null() {
+                    // <next> -> <prev> -x-> <curr>, anchor = null, anchor_next = null
+                    debug_assert!(self.anchor_next.is_null());
+                    Snapshot::swap(&mut self.next, &mut self.anchor);
+                    // <anchor> -> <prev> -x-> <curr>
+                } else if self.anchor_next.is_null() {
+                    // <anchor> -> <next> -x-> <prev> -x-> <curr>, anchor_next = null
+                    Snapshot::swap(&mut self.next, &mut self.anchor_next);
+                    // <anchor> -> <anchor_next> -x-> <prev> -x-> <curr>
+                }
                 continue;
             }
 
             match curr_node.key.cmp(key) {
                 Less => {
-                    self.prev = self.curr;
-                    self.curr = next;
-                    prev_next = next;
+                    Snapshot::swap(&mut self.prev, &mut self.curr);
+                    Snapshot::swap(&mut self.curr, &mut self.next);
+                    self.anchor.clear();
+                    self.anchor_next.clear();
                 }
-                Equal => break Some(&curr_node.value),
-                Greater => break None,
+                Equal => break true,
+                Greater => break false,
             }
         };
 
-        // If prev and curr WERE adjacent, no need to clean up
-        if prev_next.ptr_eq(self.curr) {
+        // If the anchor is not installed, no need to clean up
+        if self.anchor.is_null() {
             return Ok(found);
         }
 
         // cleanup tagged nodes between anchor and curr
-        self.prev
-            .as_ref()
-            .unwrap()
+        let expected = if self.anchor_next.is_null() {
+            &self.prev
+        } else {
+            &self.anchor_next
+        };
+        unsafe { self.anchor.deref() }
             .next
             .compare_exchange(
-                prev_next,
+                expected,
                 self.curr.counted(),
                 Ordering::Release,
                 Ordering::Relaxed,
-                guard,
             )
             .map_err(|_| ())?;
 
+        Snapshot::swap(&mut self.anchor, &mut self.prev);
         Ok(found)
     }
 
     /// Inserts a value.
     #[inline]
-    pub fn insert(self, node: Rc<Node<K, V>>, guard: &Guard) -> Result<(), Rc<Node<K, V>>> {
+    fn insert(&mut self, node: Rc<Node<K, V>>) -> Result<(), Rc<Node<K, V>>> {
         node.as_ref()
             .unwrap()
             .next
             .swap(self.curr.counted(), Ordering::Relaxed);
 
-        match self.prev.as_ref().unwrap().next.compare_exchange(
-            self.curr,
-            node,
-            Ordering::Release,
-            Ordering::Relaxed,
-            guard,
-        ) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(e.desired),
-        }
+        self.prev
+            .as_ref()
+            .unwrap()
+            .next
+            .compare_exchange(&self.curr, node, Ordering::Release, Ordering::Relaxed)
+            .map(|_| ())
+            .map_err(|e| e.desired)
     }
 
     /// removes the current node.
     #[inline]
-    pub fn remove(self, guard: &Guard) -> Result<(), ()> {
-        let curr_node = self.curr.as_ref().unwrap();
+    fn remove(&mut self) -> Result<(), ()> {
+        let curr_node = unsafe { self.curr.deref() };
 
-        let next = curr_node.next.load(Ordering::Acquire, guard);
-        let e = curr_node.next.compare_exchange_tag(
-            next.with_tag(0),
-            1,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-            guard,
-        );
-        if e.is_err() {
-            return Err(());
-        }
+        curr_node.next.load(&mut self.next, Ordering::Acquire);
+        curr_node
+            .next
+            .compare_exchange_tag(
+                self.next.with_tag(0),
+                1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .map_err(|_| ())?;
 
-        let _ = self.prev.as_ref().unwrap().next.compare_exchange(
-            self.curr,
-            next.counted(),
-            Ordering::Release,
-            Ordering::Relaxed,
-            guard,
-        );
-
-        Ok(())
+        unsafe { self.prev.deref() }
+            .next
+            .compare_exchange(
+                &self.curr,
+                self.next.counted(),
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .map(|_| ())
+            .map_err(|_| ())
     }
 }
 
@@ -188,71 +216,95 @@ where
     }
 
     #[inline]
-    fn get<'g, F>(&'g self, key: &K, find: F, guard: &'g Guard) -> (Option<&'g V>, Cursor<'g, K, V>)
+    fn get<'h, F>(&'h self, key: &K, find: F, cursor: &'h mut Cursor<K, V>) -> Option<&'h V>
     where
-        F: Fn(&mut Cursor<'g, K, V>, &K, &'g Guard) -> Result<Option<&'g V>, ()>,
+        F: Fn(&mut Cursor<K, V>, &K) -> Result<bool, ()>,
+    {
+        if self.get_inner(key, find, cursor) {
+            Some(cursor.curr.as_ref().map(|node| &node.value).unwrap())
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn get_inner<'h, F>(&'h self, key: &K, find: F, cursor: &'h mut Cursor<K, V>) -> bool
+    where
+        F: Fn(&mut Cursor<K, V>, &K) -> Result<bool, ()>,
     {
         loop {
-            let mut cursor = Cursor::new(&self.head, guard);
-            if let Ok(r) = find(&mut cursor, key, guard) {
-                return (r, cursor);
+            cursor.initialize(&self.head);
+            if let Ok(r) = find(cursor, key) {
+                return r;
             }
         }
     }
 
     #[inline]
-    fn insert<'g, F>(&'g self, key: K, value: V, find: F, guard: &'g Guard) -> Option<&'g V>
+    fn insert<'h, F>(&'h self, key: K, value: V, find: F, cursor: &'h mut Cursor<K, V>) -> bool
     where
-        F: Fn(&mut Cursor<'g, K, V>, &K, &'g Guard) -> Result<Option<&'g V>, ()>,
+        F: Fn(&mut Cursor<K, V>, &K) -> Result<bool, ()>,
     {
         let mut node = Rc::new(Node::new(key, value));
         loop {
-            let (found, cursor) =
-                self.get(node.as_ref().map(|node| &node.key).unwrap(), &find, guard);
-            if found.is_some() {
-                return found;
+            let found = self.get_inner(node.as_ref().map(|node| &node.key).unwrap(), &find, cursor);
+            if found {
+                return false;
             }
 
-            match cursor.insert(node, guard) {
+            match cursor.insert(node) {
                 Err(n) => node = n,
-                Ok(()) => return None,
+                Ok(()) => return true,
             }
         }
     }
 
     #[inline]
-    fn remove<'g, F>(&'g self, key: &K, find: F, guard: &'g Guard) -> Option<&'g V>
+    fn remove<'h, F>(&'h self, key: &K, find: F, cursor: &'h mut Cursor<K, V>) -> Option<&'h V>
     where
-        F: Fn(&mut Cursor<'g, K, V>, &K, &'g Guard) -> Result<Option<&'g V>, ()>,
+        F: Fn(&mut Cursor<K, V>, &K) -> Result<bool, ()>,
+    {
+        if self.remove_inner(key, find, cursor) {
+            Some(cursor.curr.as_ref().map(|node| &node.value).unwrap())
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn remove_inner<'h, F>(&'h self, key: &K, find: F, cursor: &'h mut Cursor<K, V>) -> bool
+    where
+        F: Fn(&mut Cursor<K, V>, &K) -> Result<bool, ()>,
     {
         loop {
-            let (found, cursor) = self.get(key, &find, guard);
-            found?;
+            let found = self.get_inner(key, &find, cursor);
+            if !found {
+                return false;
+            }
 
-            match cursor.remove(guard) {
+            match cursor.remove() {
                 Err(()) => continue,
-                Ok(_) => return found,
+                Ok(_) => return true,
             }
         }
     }
 
-    pub fn harris_get<'g>(&'g self, key: &K, guard: &'g Guard) -> Option<&'g V> {
-        self.get(key, Cursor::find_harris, guard).0
+    pub fn harris_get<'h>(&'h self, key: &K, cursor: &'h mut Cursor<K, V>) -> Option<&'h V> {
+        self.get(key, Cursor::find_harris, cursor)
     }
 
-    pub fn harris_insert<'g>(&'g self, key: K, value: V, guard: &'g Guard) -> Option<&'g V> {
-        self.insert(key, value, Cursor::find_harris, guard)
+    pub fn harris_insert<'h>(&'h self, key: K, value: V, cursor: &'h mut Cursor<K, V>) -> bool {
+        self.insert(key, value, Cursor::find_harris, cursor)
     }
 
-    pub fn harris_remove<'g>(&'g self, key: &K, guard: &'g Guard) -> Option<&'g V> {
-        self.remove(key, Cursor::find_harris, guard)
+    pub fn harris_remove<'h>(&'h self, key: &K, cursor: &'h mut Cursor<K, V>) -> Option<&'h V> {
+        self.remove(key, Cursor::find_harris, cursor)
     }
 }
 
 #[test]
 fn smoke() {
     extern crate rand;
-    use circ::cs;
     use crossbeam_utils::thread;
     use rand::prelude::*;
 
@@ -268,8 +320,9 @@ fn smoke() {
                 let mut keys: Vec<i32> =
                     (0..ELEMENTS_PER_THREADS).map(|k| k * THREADS + t).collect();
                 keys.shuffle(rng);
+                let cursor = &mut Cursor::default();
                 for i in keys {
-                    assert!(map.harris_insert(i, i.to_string(), &cs()).is_none());
+                    assert!(map.harris_insert(i, i.to_string(), cursor));
                 }
             });
         }
@@ -277,33 +330,21 @@ fn smoke() {
     .unwrap();
 
     thread::scope(|s| {
-        for t in 0..(THREADS / 2) {
+        for t in 0..THREADS {
             s.spawn(move |_| {
                 let rng = &mut rand::thread_rng();
                 let mut keys: Vec<i32> =
                     (0..ELEMENTS_PER_THREADS).map(|k| k * THREADS + t).collect();
                 keys.shuffle(rng);
-                let mut guard = cs();
-                for i in keys {
-                    assert_eq!(i.to_string(), *map.harris_remove(&i, &guard).unwrap());
-                    guard = cs();
-                }
-            });
-        }
-    })
-    .unwrap();
-
-    thread::scope(|s| {
-        for t in (THREADS / 2)..THREADS {
-            s.spawn(move |_| {
-                let rng = &mut rand::thread_rng();
-                let mut keys: Vec<i32> =
-                    (0..ELEMENTS_PER_THREADS).map(|k| k * THREADS + t).collect();
-                keys.shuffle(rng);
-                let mut guard = cs();
-                for i in keys {
-                    assert_eq!(i.to_string(), *map.harris_get(&i, &guard).unwrap());
-                    guard = cs();
+                let cursor = &mut Cursor::default();
+                if t < THREADS / 2 {
+                    for i in keys {
+                        assert_eq!(i.to_string(), *map.harris_remove(&i, cursor).unwrap());
+                    }
+                } else {
+                    for i in keys {
+                        assert_eq!(i.to_string(), *map.harris_get(&i, cursor).unwrap());
+                    }
                 }
             });
         }

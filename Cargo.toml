@@ -20,6 +20,7 @@ atomic = "0.5"
 cfg-if = "1.0"
 rustc-hash = "1.1.0"
 memoffset = "0.7"
+membarrier = { git = "https://github.com/jeehoonkang/membarrier-rs.git", branch = "smr-benchmark" }
 
 [dev-dependencies]
 rand = "0.8"

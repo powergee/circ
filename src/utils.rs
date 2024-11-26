@@ -1,10 +1,8 @@
-use std::cell::Cell;
-use std::mem::transmute;
 use std::sync::atomic::Ordering;
 use std::{mem::ManuallyDrop, sync::atomic::AtomicU64};
 
-use crate::ebr_impl::{cs, global_epoch, Guard, Tagged, HIGH_TAG_WIDTH};
-use crate::{EdgeTaker, Rc, RcObject};
+use crate::hp_impl::{with_thread, Tagged, Thread};
+use crate::RcObject;
 
 /// Raw pointer to a reference counted object. Allows tagging.
 pub(crate) type Raw<T> = Tagged<RcInner<T>>;
@@ -15,47 +13,37 @@ trait Deferable {
         F: FnOnce(*mut RcInner<T>);
 }
 
-impl Deferable for Guard {
+impl Deferable for Thread {
     unsafe fn defer_with_inner<T, F>(&self, ptr: *mut RcInner<T>, f: F)
     where
         F: FnOnce(*mut RcInner<T>),
     {
         debug_assert!(!ptr.is_null());
-        self.defer_unchecked(move || f(ptr));
+        self.defer(ptr, || f(ptr));
     }
 }
 
-impl Deferable for Option<&Guard> {
+impl Deferable for Option<&Thread> {
     unsafe fn defer_with_inner<T, F>(&self, ptr: *mut RcInner<T>, f: F)
     where
         F: FnOnce(*mut RcInner<T>),
     {
-        if let Some(guard) = self {
-            guard.defer_with_inner(ptr, f)
+        if let Some(thread) = self {
+            thread.defer(ptr, || f(ptr));
         } else {
-            cs().defer_with_inner(ptr, f)
+            with_thread(move |thread| thread.defer(ptr, move || f(ptr)));
         }
     }
 }
 
-const EPOCH_WIDTH: u32 = HIGH_TAG_WIDTH;
-const EPOCH_MASK_HEIGHT: u32 = u64::BITS - EPOCH_WIDTH;
-const EPOCH: u64 = ((1 << EPOCH_WIDTH) - 1) << EPOCH_MASK_HEIGHT;
-const DESTRUCTED: u64 = 1 << (EPOCH_MASK_HEIGHT - 1);
-const WEAKED: u64 = 1 << (EPOCH_MASK_HEIGHT - 2);
-const TOTAL_COUNT_WIDTH: u32 = u64::BITS - EPOCH_WIDTH - 2;
-const WEAK_WIDTH: u32 = TOTAL_COUNT_WIDTH / 2;
-const STRONG_WIDTH: u32 = TOTAL_COUNT_WIDTH - WEAK_WIDTH;
-const STRONG: u64 = (1 << STRONG_WIDTH) - 1;
-const WEAK: u64 = ((1 << WEAK_WIDTH) - 1) << STRONG_WIDTH;
+const DESTRUCTED: u64 = 1 << (u64::BITS - 1);
+const WEAKED: u64 = 1 << (u64::BITS - 2);
+const STRONG: u64 = (1 << 31) - 1;
+const WEAK: u64 = ((1 << 31) - 1) << 31;
 const COUNT: u64 = 1;
-const WEAK_COUNT: u64 = 1 << STRONG_WIDTH;
+const WEAK_COUNT: u64 = 1 << 31;
 
-thread_local! {
-    static DISPOSE_COUNTER: Cell<usize> = const { Cell::new(0) };
-}
-
-/// Effectively wraps the presence of epoch and destruction bits.
+/// Effectively wraps the presence of destruction bits.
 #[derive(Clone, Copy)]
 struct State {
     inner: u64,
@@ -64,10 +52,6 @@ struct State {
 impl State {
     fn from_raw(inner: u64) -> Self {
         Self { inner }
-    }
-
-    fn epoch(self) -> u32 {
-        ((self.inner & EPOCH) >> EPOCH_MASK_HEIGHT) as u32
     }
 
     fn strong(self) -> u32 {
@@ -86,17 +70,8 @@ impl State {
         (self.inner & WEAKED) != 0
     }
 
-    fn with_epoch(self, epoch: usize) -> Self {
-        Self::from_raw((self.inner & !EPOCH) | (((epoch as u64) << EPOCH_MASK_HEIGHT) & EPOCH))
-    }
-
     fn add_strong(self, val: u32) -> Self {
         Self::from_raw(self.inner + (val as u64) * COUNT)
-    }
-
-    fn sub_strong(self, val: u32) -> Self {
-        debug_assert!(self.strong() >= val);
-        Self::from_raw(self.inner - (val as u64) * COUNT)
     }
 
     fn add_weak(self, val: u32) -> Self {
@@ -116,41 +91,8 @@ impl State {
     }
 }
 
-struct Modular<const WIDTH: u32> {
-    max: isize,
-}
-
-impl<const WIDTH: u32> Modular<WIDTH> {
-    /// Creates a modular space where `max` ia the maximum.
-    pub fn new(max: isize) -> Self {
-        Self { max }
-    }
-
-    // Sends a number to a modular space.
-    fn trans(&self, val: isize) -> isize {
-        debug_assert!(val <= self.max);
-        (val - (self.max + 1)) % (1 << WIDTH)
-    }
-
-    // Receives a number from a modular space.
-    fn inver(&self, val: isize) -> isize {
-        (val + (self.max + 1)) % (1 << WIDTH)
-    }
-
-    pub fn max(&self, nums: &[isize]) -> isize {
-        self.inver(nums.iter().fold(isize::MIN, |acc, val| {
-            acc.max(self.trans(val % (1 << WIDTH)))
-        }))
-    }
-
-    // Checks if `a` is less than or equal to `b` in the modular space.
-    pub fn le(&self, a: isize, b: isize) -> bool {
-        self.trans(a) <= self.trans(b)
-    }
-}
-
 /// A reference-counted object of type `T` with an atomic reference counts.
-pub(crate) struct RcInner<T> {
+pub struct RcInner<T> {
     storage: ManuallyDrop<T>,
     state: AtomicU64,
 }
@@ -234,7 +176,7 @@ impl<T> RcInner<T> {
     }
 
     #[inline]
-    pub(crate) unsafe fn decrement_weak(ptr: *mut Self, guard: Option<&Guard>) {
+    pub(crate) unsafe fn decrement_weak(ptr: *mut Self, guard: Option<&Thread>) {
         debug_assert!(State::from_raw((*ptr).state.load(Ordering::SeqCst)).weak() >= 1);
         if State::from_raw((*ptr).state.fetch_sub(WEAK_COUNT, Ordering::SeqCst)).weak() == 1 {
             guard.defer_with_inner(ptr, |inner| Self::try_dealloc(inner));
@@ -261,38 +203,10 @@ impl<T> RcInner<T> {
 
 impl<T: RcObject> RcInner<T> {
     #[inline]
-    pub(crate) unsafe fn decrement_strong(ptr: *mut Self, count: u32, guard: Option<&Guard>) {
-        let epoch = global_epoch();
-        // Should mark the current epoch on the strong count with CAS.
-        let hit_zero = loop {
-            let curr = State::from_raw((*ptr).state.load(Ordering::SeqCst));
-            debug_assert!(curr.strong() >= count);
-            if (*ptr)
-                .state
-                .compare_exchange(
-                    curr.as_raw(),
-                    curr.with_epoch(epoch).sub_strong(count).as_raw(),
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                )
-                .is_ok()
-            {
-                break curr.strong() == count;
-            }
-        };
-
-        let trigger_recl = |guard: &Guard| {
-            if hit_zero {
-                guard.defer_with_inner(ptr, |inner| Self::try_destruct(inner));
-            }
-            // Periodically triggers a collection.
-            guard.incr_manual_collection();
-        };
-
-        if let Some(guard) = guard {
-            trigger_recl(guard)
-        } else {
-            trigger_recl(&cs())
+    pub(crate) unsafe fn decrement_strong(ptr: *mut Self, count: u32, guard: Option<&Thread>) {
+        let count = count as u64 * COUNT;
+        if (*ptr).state.fetch_sub(count, Ordering::SeqCst) & STRONG == count {
+            guard.defer_with_inner(ptr, |inner| Self::try_destruct(inner));
         }
     }
 
@@ -312,145 +226,17 @@ impl<T: RcObject> RcInner<T> {
                 Ordering::SeqCst,
             ) {
                 // Note that `decrement_weak` will be called in `dispose`.
-                Ok(_) => return dispose(ptr),
+                Ok(_) => {
+                    ManuallyDrop::drop(&mut (*ptr).storage);
+                    if !old.weaked() {
+                        Self::dealloc(ptr);
+                    } else {
+                        Self::decrement_weak(ptr, None);
+                    }
+                    return;
+                }
                 Err(curr) => old = State::from_raw(curr),
             }
         }
     }
-}
-
-#[inline]
-unsafe fn dispose<T: RcObject>(inner: *mut RcInner<T>) {
-    DISPOSE_COUNTER.with(|counter| {
-        let guard = &cs();
-        dispose_general_node(inner, DisposeContext::new(0, counter, guard));
-    });
-}
-
-#[derive(Clone)]
-pub(crate) struct DisposeContext<'d> {
-    depth: usize,
-    counter: &'d Cell<usize>,
-    guard: &'d Guard,
-}
-
-impl<'d> DisposeContext<'d> {
-    fn new(depth: usize, counter: &'d Cell<usize>, guard: &'d Guard) -> Self {
-        Self {
-            depth,
-            counter,
-            guard,
-        }
-    }
-
-    fn deepen(self) -> Self {
-        Self {
-            depth: self.depth + 1,
-            counter: self.counter,
-            guard: self.guard,
-        }
-    }
-}
-
-#[inline]
-unsafe fn dispose_general_node<T: RcObject>(ptr: *mut RcInner<T>, ctx: DisposeContext<'_>) {
-    let rc = match ptr.as_mut() {
-        Some(rc) => rc,
-        None => return,
-    };
-
-    let count = ctx.counter.get();
-    ctx.counter.set(count + 1);
-    if count % 128 == 0 {
-        if let Some(local) = ctx.guard.local.as_ref() {
-            local.repin_without_collect();
-        }
-    }
-
-    if ctx.depth >= 1024 {
-        // Prevent a potential stack overflow.
-        ctx.guard
-            .defer_with_inner(rc, |rc| RcInner::try_destruct(rc));
-        return;
-    }
-
-    let state = State::from_raw(rc.state.load(Ordering::SeqCst));
-    let node_epoch = state.epoch();
-    debug_assert_eq!(state.strong(), 0);
-
-    let curr_epoch = global_epoch();
-    let modu: Modular<EPOCH_WIDTH> = Modular::new(curr_epoch as isize + 1);
-    let mut outgoings = Vec::new();
-
-    // Note that checking whether it is a root is necessary, because if `node_epoch` is
-    // old enough, `modu.le` may return false.
-    if ctx.depth == 0 || modu.le(node_epoch as _, curr_epoch as isize - 3) {
-        // The current node is immediately reclaimable.
-        // Before freeing this allocation, let's collect outgoing edges.
-        rc.data_mut().pop_edges(&mut EdgeTaker::new(&mut outgoings));
-
-        ManuallyDrop::drop(&mut rc.storage);
-        if State::from_raw(rc.state.load(Ordering::SeqCst)).weaked() {
-            RcInner::decrement_weak(rc, Some(ctx.guard));
-        } else {
-            RcInner::dealloc(rc);
-        }
-
-        for next in outgoings.drain(..) {
-            next.try_ird(ctx.clone(), node_epoch);
-        }
-    } else {
-        // It is likely to be unsafe to reclaim right now.
-        ctx.guard
-            .defer_with_inner(rc, |rc| RcInner::try_destruct(rc));
-    }
-}
-
-#[inline]
-unsafe fn try_imm_recur_destr<T: RcObject>(next: Rc<T>, ctx: DisposeContext<'_>, succ_epoch: u32) {
-    if next.is_null() {
-        return;
-    }
-
-    let modu: Modular<EPOCH_WIDTH> = Modular::new(global_epoch() as isize + 1);
-    let next_ptr = next.into_raw();
-    let next_ref = next_ptr.deref();
-    let link_epoch = next_ptr.high_tag() as u32;
-
-    // Decrement next node's strong count and update its epoch.
-    let next_cnt = loop {
-        let cnt_curr = State::from_raw(next_ref.state.load(Ordering::SeqCst));
-        let next_epoch = modu.max(&[succ_epoch as _, link_epoch as _, cnt_curr.epoch() as _]);
-        let cnt_next = cnt_curr.sub_strong(1).with_epoch(next_epoch as _);
-
-        if next_ref
-            .state
-            .compare_exchange(
-                cnt_curr.as_raw(),
-                cnt_next.as_raw(),
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_ok()
-        {
-            break cnt_next;
-        }
-    };
-
-    // If the reference count hit zero, try dispose it recursively.
-    if next_cnt.strong() == 0 {
-        dispose_general_node(next_ptr.as_raw(), ctx.deepen());
-    }
-}
-
-pub(crate) unsafe fn try_ird_with_raw<T: RcObject>(
-    next: Raw<()>,
-    ctx: DisposeContext<'_>,
-    succ_epoch: u32,
-) {
-    try_imm_recur_destr(
-        Rc::from_raw(transmute::<Raw<()>, Raw<T>>(next)),
-        ctx,
-        succ_epoch,
-    );
 }
