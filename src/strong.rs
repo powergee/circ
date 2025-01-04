@@ -880,7 +880,7 @@ impl<T> Snapshot<T> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn swap(a: &mut Self, b: &mut Self) {
         HazardPointer::swap(&mut a.shield, &mut b.shield);
         swap(&mut a.ptr, &mut b.ptr);
